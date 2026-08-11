@@ -7,10 +7,14 @@ authors = [
     { name = "Jefferson Salvador", email = "jeffsalvador.dev@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "langchain>=1.3.14",
+    "langchain-openai>=1.4.3",
+    "python-dotenv>=1.2.2",
+]
 
 [project.scripts]
-multimodal-document-ai = "multimodal_document_ai:main"
+main = "multimodal_document_ai.main:main"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
