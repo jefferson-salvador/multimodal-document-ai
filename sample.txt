@@ -1,0 +1,4 @@
+Hello! This is a sample document.
+
+My name is Jefferson.
+I am learning Python and AI.
