@@ -1,197 +1,402 @@
 import base64
+import json
+from pathlib import Path
 
 import pymupdf
 from docx import Document
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sklearn.metrics.pairwise import cosine_similarity
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
 
+IMAGE_EXTENSIONS = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+}
+
+TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+}
+
+
 def encode_image(file_path: str) -> str:
     """Convert an image file into a base64 string."""
+
     with open(file_path, "rb") as file:
         return base64.b64encode(file.read()).decode("utf-8")
 
 
-@tool
-def analyze_image(file_path: str, question: str) -> str:
-    """Analyze an image and answer a question about it."""
+def analyze_image(
+    model: ChatOpenAI,
+    file_path: str,
+) -> str:
+    """Analyze an image and return its title and description."""
+
     image_data = encode_image(file_path)
 
     message = HumanMessage(
         content=[
             {
                 "type": "text",
-                "text": question,
+                "text": (
+                    "Analyze this image.\n\n"
+                    "Return exactly this format:\n\n"
+                    "Title: <short title>\n"
+                    "Description: <detailed description>"
+                ),
             },
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                "image_url": {"url": (f"data:image/png;base64,{image_data}")},
             },
         ]
     )
-
-    model = ChatOpenAI(model="gpt-5-nano")
 
     response = model.invoke([message])
 
     return response.content
 
 
-@tool
-def read_file(file_path: str) -> str:
-    """Read a .txt, .md, .pdf, or .docx file and return its text."""
-    try:
-        if file_path.endswith((".txt", ".md")):
-            with open(file_path, "r") as file:
-                return file.read()
+def summarize_document(
+    model: ChatOpenAI,
+    content: str,
+) -> str:
+    """Generate a summary of the document."""
 
-        if file_path.endswith(".pdf"):
-            document = pymupdf.open(file_path)
+    message = HumanMessage(
+        content=(
+            "Summarize the following document.\n\n"
+            "Give a clear and concise summary of what "
+            "the document contains.\n\n"
+            "Document content:\n\n"
+            f"{content}"
+        )
+    )
 
-            text = ""
+    response = model.invoke([message])
 
-            for page in document:
-                text += page.get_text()
+    return response.content
 
-            document.close()
 
-            return text
+def read_text_file(file_path: str) -> list[dict]:
+    """Read a text or markdown file."""
 
-        if file_path.endswith(".docx"):
-            document = Document(file_path)
+    with open(file_path, "r", encoding="utf-8") as file:
+        text = file.read()
 
-            text = ""
+    return [
+        {
+            "type": "text",
+            "content": text,
+        }
+    ]
 
-            for paragraph in document.paragraphs:
-                text += paragraph.text + "\n"
 
-            return text
+def read_pdf(file_path: str) -> list[dict]:
+    """
+    Extract text and images from a PDF
+    while preserving their document order.
+    """
 
-        return (
-            "Unsupported file type. "
-            "Only .txt, .md, .pdf, and .docx files are supported."
+    document = pymupdf.open(file_path)
+
+    elements = []
+
+    for page_number, page in enumerate(document):
+        blocks = page.get_text("dict")["blocks"]
+
+        for block in blocks:
+            block_type = block["type"]
+
+            # --------------------------------
+            # TEXT
+            # --------------------------------
+
+            if block_type == 0:
+                text = ""
+
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        text += span["text"]
+
+                text = text.strip()
+
+                if text:
+                    elements.append(
+                        {
+                            "type": "text",
+                            "page": page_number,
+                            "y": block["bbox"][1],
+                            "x": block["bbox"][0],
+                            "content": text,
+                        }
+                    )
+
+            # --------------------------------
+            # IMAGE
+            # --------------------------------
+
+            elif block_type == 1:
+                image_bytes = block["image"]
+                image_extension = block["ext"]
+
+                image_path = (
+                    f"extracted_image_"
+                    f"{page_number + 1}_"
+                    f"{len(elements) + 1}."
+                    f"{image_extension}"
+                )
+
+                with open(image_path, "wb") as file:
+                    file.write(image_bytes)
+
+                elements.append(
+                    {
+                        "type": "image",
+                        "page": page_number,
+                        "y": block["bbox"][1],
+                        "x": block["bbox"][0],
+                        "file_path": image_path,
+                    }
+                )
+
+    document.close()
+
+    # Sort by page, then top-to-bottom,
+    # then left-to-right.
+    elements.sort(
+        key=lambda element: (
+            element["page"],
+            element["y"],
+            element["x"],
+        )
+    )
+
+    return elements
+
+
+def read_docx(file_path: str) -> list[dict]:
+    """
+    Extract text and images from a DOCX
+    while preserving their document order.
+    """
+
+    document = Document(file_path)
+
+    elements = []
+
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+
+        if text:
+            elements.append(
+                {
+                    "type": "text",
+                    "content": text,
+                }
+            )
+
+        # Look for images inside this paragraph
+        for run in paragraph.runs:
+            drawings = run._element.xpath(".//w:drawing")
+
+            for drawing in drawings:
+                blips = drawing.xpath(".//a:blip")
+
+                for blip in blips:
+                    relationship_id = blip.get(
+                        "{http://schemas.openxmlformats.org/"
+                        "officeDocument/2006/relationships}"
+                        "embed"
+                    )
+
+                    if not relationship_id:
+                        continue
+
+                    relationship = document.part.rels[relationship_id]
+
+                    image_data = relationship.target_part.blob
+
+                    image_extension = Path(relationship.target_ref).suffix
+
+                    image_path = f"extracted_image_{len(elements) + 1}{image_extension}"
+
+                    with open(image_path, "wb") as file:
+                        file.write(image_data)
+
+                    elements.append(
+                        {
+                            "type": "image",
+                            "file_path": image_path,
+                        }
+                    )
+
+    return elements
+
+
+def process_document(
+    model: ChatOpenAI,
+    elements: list[dict],
+) -> dict:
+    """Process a document and return summary and content."""
+
+    # --------------------------------
+    # GET TEXT FOR SUMMARY
+    # --------------------------------
+
+    text_parts = []
+
+    for element in elements:
+        if element["type"] == "text":
+            text_parts.append(element["content"])
+
+    document_text = "\n\n".join(text_parts)
+
+    # --------------------------------
+    # SUMMARY
+    # --------------------------------
+
+    summary = summarize_document(
+        model,
+        document_text,
+    )
+
+    # --------------------------------
+    # CONTENT
+    # --------------------------------
+
+    content_parts = []
+
+    for element in elements:
+        # -----------------------------
+        # TEXT
+        # -----------------------------
+
+        if element["type"] == "text":
+            content_parts.append(element["content"])
+
+        # -----------------------------
+        # IMAGE
+        # -----------------------------
+
+        elif element["type"] == "image":
+            result = analyze_image(
+                model,
+                element["file_path"],
+            )
+
+            content_parts.append(result)
+
+    content = "\n\n".join(content_parts)
+
+    return {
+        "summary": summary,
+        "content": content,
+    }
+
+
+def process_file(
+    model: ChatOpenAI,
+    file_path: str,
+) -> dict | None:
+    """Determine the file type and process it."""
+
+    path = Path(file_path)
+
+    if not path.exists():
+        print(f"File not found: {file_path}")
+        return None
+
+    extension = path.suffix.lower()
+
+    # --------------------------------
+    # STANDALONE IMAGE
+    # --------------------------------
+
+    if extension in IMAGE_EXTENSIONS:
+        result = analyze_image(
+            model,
+            file_path,
         )
 
-    except FileNotFoundError:
-        return f"File not found: {file_path}"
+        return {
+            "summary": "",
+            "content": result,
+        }
+
+    # --------------------------------
+    # TXT / MD
+    # --------------------------------
+
+    if extension in TEXT_EXTENSIONS:
+        elements = read_text_file(file_path)
+
+        return process_document(
+            model,
+            elements,
+        )
+
+    # --------------------------------
+    # PDF
+    # --------------------------------
+
+    if extension == ".pdf":
+        elements = read_pdf(file_path)
+
+        return process_document(
+            model,
+            elements,
+        )
+
+    # --------------------------------
+    # DOCX
+    # --------------------------------
+
+    if extension == ".docx":
+        elements = read_docx(file_path)
+
+        return process_document(
+            model,
+            elements,
+        )
+
+    print(
+        "Unsupported file type.\n\n"
+        "Supported types:\n"
+        ".txt\n"
+        ".md\n"
+        ".pdf\n"
+        ".docx\n"
+        ".png\n"
+        ".jpg\n"
+        ".jpeg\n"
+        ".webp\n"
+        ".gif"
+    )
+
+    return None
 
 
 def main():
-    text = read_file.invoke({"file_path": "sample.pdf"})
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=200,
-        chunk_overlap=30,
-    )
-
-    chunks = splitter.split_text(text)
-
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-
-    vectors = embeddings.embed_documents(chunks)
-
-    question = input("What is your question? ")
-
-    question_vector = embeddings.embed_query(question)
-
-    similarities = cosine_similarity(
-        [question_vector],
-        vectors,
-    )[0]
-
-    for i, (chunk, similarity) in enumerate(zip(chunks, similarities)):
-        print(f"\n--- Chunk {i} ---")
-        print(f"Similarity: {similarity}")
-        print(chunk)
-
-
-def main1():
-    text = read_file.invoke({"file_path": "sample.pdf"})
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
-    )
-
-    chunks = splitter.split_text(text)
-
-    print(f"Number of chunks: {len(chunks)}")
-
-    for i, chunk in enumerate(chunks):
-        print(f"\n--- Chunk {i} ---")
-        print(chunk)
-
-
-def main2():
     model = ChatOpenAI(model="gpt-5-nano")
 
-    tools = {
-        "read_file": read_file,
-        "analyze_image": analyze_image,
-    }
+    file_path = input("Enter the path of the file to analyze: ")
 
-    model_with_tools = model.bind_tools(list(tools.values()))
-
-    system_message = SystemMessage(
-        content=(
-            "You are a document assistant.\n\n"
-            "Available files:\n"
-            "- sample.txt\n"
-            "- notes.md\n"
-            "- sample.pdf\n"
-            "- sample.docx\n"
-            "- sample.png\n\n"
-            "Tools:\n"
-            "- read_file: Use this to read .txt, .md, .pdf, or .docx files.\n"
-            "- analyze_image: Use this to inspect an image.\n\n"
-            "When the user asks a question that requires information from "
-            "one of these files, you MUST use the appropriate tool before answering."
-        )
+    result = process_file(
+        model,
+        file_path,
     )
 
-    question = input("What is your question? ")
-
-    response = model_with_tools.invoke(
-        [
-            system_message,
-            question,
-        ]
-    )
-
-    if response.tool_calls:
-        tool_messages = []
-
-        for tool_call in response.tool_calls:
-            tool = tools[tool_call["name"]]
-
-            result = tool.invoke(tool_call)
-
-            tool_message = ToolMessage(
-                content=result,
-                tool_call_id=tool_call["id"],
-            )
-
-            tool_messages.append(tool_message)
-
-        final_response = model_with_tools.invoke(
-            [
-                system_message,
-                question,
-                response,
-                *tool_messages,
-            ]
-        )
-
-        print(final_response.content)
-
-    else:
-        print(response.content)
+    print(result)
+    print("\n")
+    print("\n")
+    print(json.dumps(result, indent=4))
 
 
 if __name__ == "__main__":
