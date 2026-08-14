@@ -32,6 +32,7 @@ def encode_image(file_path: str) -> str:
         return base64.b64encode(file.read()).decode("utf-8")
 
 
+
 def analyze_image(
     model: ChatOpenAI,
     file_path: str,
@@ -40,6 +41,21 @@ def analyze_image(
 
     image_data = encode_image(file_path)
 
+    extension = Path(file_path).suffix.lower()
+
+    mime_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }
+
+    mime_type = mime_types.get(extension)
+
+    if not mime_type:
+        raise ValueError(f"Unsupported image type: {extension}")
+
     message = HumanMessage(
         content=[
             {
@@ -47,13 +63,15 @@ def analyze_image(
                 "text": (
                     "Analyze this image.\n\n"
                     "Return exactly this format:\n\n"
-                    "Title: <short title>\n"
+                    "Image Title: <short title>\n"
                     "Description: <detailed description>"
                 ),
             },
             {
                 "type": "image_url",
-                "image_url": {"url": (f"data:image/png;base64,{image_data}")},
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{image_data}"
+                },
             },
         ]
     )
@@ -67,15 +85,18 @@ def summarize_document(
     model: ChatOpenAI,
     content: str,
 ) -> str:
-    """Generate a summary of the document."""
+    """Generate a short summary of the content."""
 
     message = HumanMessage(
         content=(
-            "Summarize the following document.\n\n"
-            "Give a clear and concise summary of what "
-            "the document contains.\n\n"
-            "Document content:\n\n"
-            f"{content}"
+            "Summarize the following content in one short sentence.\n\n"
+            "The summary must be significantly shorter than the original content.\n"
+            "Keep only the main subject or key information.\n"
+            "Do not describe details unless they are important to the main subject.\n"
+            "Do not repeat the content word-for-word.\n"
+            "Do not start with phrases like 'The document is' or "
+            "'The image shows'.\n\n"
+            f"Content:\n\n{content}"
         )
     )
 
@@ -239,24 +260,45 @@ def read_docx(file_path: str) -> list[dict]:
 
     return elements
 
-
 def process_document(
     model: ChatOpenAI,
     elements: list[dict],
 ) -> dict:
     """Process a document and return summary and content."""
 
-    # --------------------------------
-    # GET TEXT FOR SUMMARY
-    # --------------------------------
-
-    text_parts = []
+    content_parts = []
 
     for element in elements:
-        if element["type"] == "text":
-            text_parts.append(element["content"])
+        # --------------------------------
+        # TEXT
+        # --------------------------------
 
-    document_text = "\n\n".join(text_parts)
+        if element["type"] == "text":
+            content_parts.append(element["content"])
+
+        # --------------------------------
+        # IMAGE
+        # --------------------------------
+
+        elif element["type"] == "image":
+            file_path = element["file_path"]
+
+            try:
+                result = analyze_image(
+                    model,
+                    file_path,
+                )
+
+                content_parts.append(result)
+
+            finally:
+                Path(file_path).unlink(missing_ok=True)
+
+    # --------------------------------
+    # CONTENT
+    # --------------------------------
+
+    content = "\n\n".join(content_parts)
 
     # --------------------------------
     # SUMMARY
@@ -264,42 +306,13 @@ def process_document(
 
     summary = summarize_document(
         model,
-        document_text,
+        content,
     )
-
-    # --------------------------------
-    # CONTENT
-    # --------------------------------
-
-    content_parts = []
-
-    for element in elements:
-        # -----------------------------
-        # TEXT
-        # -----------------------------
-
-        if element["type"] == "text":
-            content_parts.append(element["content"])
-
-        # -----------------------------
-        # IMAGE
-        # -----------------------------
-
-        elif element["type"] == "image":
-            result = analyze_image(
-                model,
-                element["file_path"],
-            )
-
-            content_parts.append(result)
-
-    content = "\n\n".join(content_parts)
 
     return {
         "summary": summary,
         "content": content,
     }
-
 
 def process_file(
     model: ChatOpenAI,
@@ -320,14 +333,19 @@ def process_file(
     # --------------------------------
 
     if extension in IMAGE_EXTENSIONS:
-        result = analyze_image(
+        content = analyze_image(
             model,
             file_path,
         )
 
+        summary = summarize_document(
+            model,
+            content,
+        )
+
         return {
-            "summary": "",
-            "content": result,
+            "summary": summary,
+            "content": content,
         }
 
     # --------------------------------
